@@ -223,8 +223,11 @@ function renderStats(stats) {
     ["清洗后", stats.cleaned_count],
     ["有效率%", stats.valid_rate],
     ["无手机删除", stats.dropped_no_mobile],
+    ["缺公司名删除", stats.dropped_no_company],
     ["公司重复", stats.duplicated_company],
     ["仅座机删除", stats.dropped_landline_only],
+    ["仅国际号删除", stats.dropped_intl_only],
+    ["无效号码删除", stats.dropped_invalid],
     ["有备用电话", stats.has_backup_phone],
   ];
   $("#stats").innerHTML = items

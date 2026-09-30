@@ -431,6 +431,9 @@ def run_agent(
                 {"label": "删除·无手机", "count": cleaned["stats"].get("dropped_no_mobile", 0)},
                 {"label": "删除·公司重复", "count": cleaned["stats"].get("duplicated_company", 0)},
                 {"label": "删除·仅座机", "count": cleaned["stats"].get("dropped_landline_only", 0)},
+                {"label": "删除·仅国际号", "count": cleaned["stats"].get("dropped_intl_only", 0)},
+                {"label": "删除·无效号码", "count": cleaned["stats"].get("dropped_invalid", 0)},
+                {"label": "删除·缺公司名", "count": cleaned["stats"].get("dropped_no_company", 0)},
             ],
         }
     except Exception as e:
@@ -443,7 +446,8 @@ def run_agent(
         "执行某公司清洗规则",
         f"原始 {stats.get('raw_count')} → 清洗后 {stats.get('cleaned_count')}（有效率 {stats.get('valid_rate')}%）；"
         f"无手机删除 {stats.get('dropped_no_mobile')}，公司重复 {stats.get('duplicated_company')}，"
-        f"仅座机 {stats.get('dropped_landline_only')}；有备用电话 {stats.get('has_backup_phone')} 家",
+        f"仅座机 {stats.get('dropped_landline_only')}，仅国际号 {stats.get('dropped_intl_only')}，"
+        f"无效号码 {stats.get('dropped_invalid')}，缺公司名 {stats.get('dropped_no_company')}；有备用电话 {stats.get('has_backup_phone')} 家",
         payload={"stats": stats},
     )
 

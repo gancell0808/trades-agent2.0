@@ -176,24 +176,59 @@ def _clean_text(v: Any) -> str:
     return re.sub(r"\s+", " ", s)
 
 
-def _segment_mobile(seg: str, pattern: re.Pattern, strip_cc: tuple[str, ...], intl_cc: tuple[str, ...]) -> str | None:
-    """单个候选段 → 合规手机号（1 开头 11 位）或 None。前缀只在段首处理。"""
+def _cfg_bits(cfg: dict[str, Any]) -> tuple[re.Pattern, tuple[str, ...], re.Pattern]:
+    """从清洗配置得到：手机号正则、可去除的国家码、强分隔符正则。"""
+    pattern = re.compile(cfg.get("mobile_pattern") or r"^1\d{10}$")
+    codes = {re.sub(r"\D", "", p) for p in (cfg.get("strip_prefixes") or ["+86", "86", "0086"])} - {""}
+    codes = {c.lstrip("0") or c for c in codes} or {"86"}
+    strip_cc = tuple(sorted(codes, key=len, reverse=True))
+    # 强分隔符（不含空格：号码内部可能带空格，如 138 1234 5678）
+    strong = [x for x in (cfg.get("split_separators") or DEFAULT_CLEANING["split_separators"])
+              if x and not x.isspace()]
+    strong += ["，", "\n", "\r", "\t"]
+    splitter = re.compile("[" + "".join(re.escape(x) for x in dict.fromkeys(strong)) + "]+")
+    return pattern, strip_cc, splitter
+
+
+def _segment_digits(seg: str, strip_cc: tuple[str, ...]) -> tuple[str, bool]:
+    """单个候选段 → (纯数字, 是否国际号)。前缀只在段首处理。"""
     seg = seg.strip()
-    seg = re.sub(r"\.0+$", "", seg)          # Excel 数值遗留的 .0
-    seg = re.sub(r"[（(]\s*0\s*[)）]", "", seg)  # +86 (0)138... 中的 (0)
+    seg = re.sub(r"\.0+$", "", seg)              # Excel 数值遗留的 .0
+    seg = re.sub(r"[（(]\s*0\s*[)）]", "", seg)   # +86 (0)138... 中的 (0)
     if not seg:
-        return None
+        return "", False
     m = re.match(r"^(\+|00)\s*(\d{1,3})", seg)
     if m:
         cc = m.group(2)
-        # 国家码：86 保留后续；其它（852/853/886/81/82…）一律视为国际号丢弃
-        if not any(cc.startswith(c) for c in strip_cc):
-            return None
-        seg = seg[m.end(1) + len(next(c for c in strip_cc if cc.startswith(c))):]
+        # 国家码：86 保留后续；其它（852/853/886/81/82…）一律视为国际号
+        hit = next((c for c in strip_cc if cc.startswith(c)), None)
+        if hit is None:
+            return re.sub(r"\D", "", seg), True
+        seg = seg[m.end(1) + len(hit):]
     digits = re.sub(r"\D", "", seg)
     if len(digits) == 13 and digits.startswith("86"):
         digits = digits[2:]
-    return digits if pattern.fullmatch(digits) else None
+    return digits, False
+
+
+def _segment_kind(seg: str, pattern: re.Pattern, strip_cc: tuple[str, ...]) -> str:
+    """'' 空 | mobile | intl | landline | invalid"""
+    digits, intl = _segment_digits(seg, strip_cc)
+    if not digits:
+        return ""
+    if intl:
+        return "intl"
+    if pattern.fullmatch(digits):
+        return "mobile"
+    if digits.startswith("0") or len(digits) in (7, 8) or digits.startswith(("400", "800")):
+        return "landline"
+    return "invalid"
+
+
+def _segment_mobile(seg: str, pattern: re.Pattern, strip_cc: tuple[str, ...]) -> str | None:
+    """单个候选段 → 合规手机号（1 开头 11 位）或 None。"""
+    digits, intl = _segment_digits(seg, strip_cc)
+    return digits if digits and not intl and pattern.fullmatch(digits) else None
 
 
 def extract_valid_mobiles(raw: Any, cleaning: dict[str, Any] | None = None) -> list[str]:
@@ -207,38 +242,51 @@ def extract_valid_mobiles(raw: Any, cleaning: dict[str, Any] | None = None) -> l
     s = _clean_text(raw)
     if not s:
         return []
-
-    pattern = re.compile(cfg.get("mobile_pattern") or r"^1\d{10}$")
-    strip_cc = tuple(sorted(
-        {re.sub(r"\D", "", p) for p in (cfg.get("strip_prefixes") or ["+86", "86", "0086"])} - {""},
-        key=len, reverse=True,
-    ))
-    strip_cc = tuple(c.lstrip("0") or c for c in strip_cc) or ("86",)
-    strip_cc = tuple(sorted(set(strip_cc), key=len, reverse=True))
-    intl_cc = tuple(re.sub(r"\D", "", p) for p in (cfg.get("drop_intl_prefixes") or []))
-
-    # 强分隔符（不含空格：号码内部可能带空格，如 138 1234 5678）
-    strong = [x for x in (cfg.get("split_separators") or DEFAULT_CLEANING["split_separators"])
-              if x and not x.isspace()]
-    strong += ["，", "\n", "\r", "\t"]
-    chunks = re.split("[" + "".join(re.escape(x) for x in dict.fromkeys(strong)) + "]+", s)
+    pattern, strip_cc, splitter = _cfg_bits(cfg)
 
     found: list[str] = []
-    for chunk in chunks:
+    for chunk in splitter.split(s):
         chunk = chunk.strip()
         if not chunk:
             continue
-        hit = _segment_mobile(chunk, pattern, strip_cc, intl_cc)
+        hit = _segment_mobile(chunk, pattern, strip_cc)
         if hit:
             found.append(hit)
             continue
         # 整段不是一个号：可能是空格分隔的多个号码（如 "13812345678 13912345678"）
         for tok in re.split(r"\s+", chunk):
-            hit = _segment_mobile(tok, pattern, strip_cc, intl_cc) if tok else None
+            hit = _segment_mobile(tok, pattern, strip_cc) if tok else None
             if hit:
                 found.append(hit)
 
     return list(dict.fromkeys(found))[:5]
+
+
+def classify_unusable(raw: Any, cleaning: dict[str, Any] | None = None) -> str:
+    """一行没有提取到手机号时，判断原因：empty | landline | intl | invalid。
+
+    多类混合时按 座机 > 国际号 > 无效号码 的优先级归类，每行只归一类。
+    """
+    cfg = cleaning or DEFAULT_CLEANING
+    s = _clean_text(raw)
+    if not re.sub(r"\D", "", s):
+        return "empty"
+    pattern, strip_cc, splitter = _cfg_bits(cfg)
+    kinds: set[str] = set()
+    for chunk in splitter.split(s):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        k = _segment_kind(chunk, pattern, strip_cc)
+        if k == "invalid" and re.search(r"\s", chunk):
+            kinds |= {_segment_kind(t, pattern, strip_cc) for t in re.split(r"\s+", chunk) if t}
+        else:
+            kinds.add(k)
+    kinds.discard("")
+    for k in ("landline", "intl", "invalid"):
+        if k in kinds:
+            return k
+    return "empty"
 
 
 def _clean_website(v: Any) -> str:
@@ -277,9 +325,11 @@ def run_maibang_clean(
         "raw_count": n,
         "cleaned_count": 0,
         "valid_rate": 0.0,
-        "dropped_no_mobile": 0,
-        "dropped_landline_only": 0,
-        "dropped_intl_only": 0,
+        "dropped_no_mobile": 0,       # 手机列为空 / 无任何数字
+        "dropped_landline_only": 0,   # 只有座机
+        "dropped_intl_only": 0,       # 只有国际号
+        "dropped_invalid": 0,         # 有数字但不是有效手机号（位数不对等）
+        "dropped_no_company": 0,      # 有手机号但缺公司名称
         "duplicated_company": 0,
         "has_backup_phone": 0,
         "multi_mobile": 0,
@@ -302,30 +352,24 @@ def run_maibang_clean(
         raw_join = " / ".join(raw_cells)
         mobiles = extract_valid_mobiles(raw_join, cfg)
 
-        # 删除原因统计
+        # 删除原因：每一行只归入一类（先看手机号，再看公司名）
         if not mobiles:
-            digits = re.sub(r"\D", "", _clean_text(raw_join))
-            if not digits:
-                stats["dropped_no_mobile"] += 1
-                reason = "无手机号"
-            elif digits.startswith("0") or (len(digits) >= 10 and not digits.startswith("1")):
-                stats["dropped_landline_only"] += 1
-                reason = "仅座机/无效号"
-            elif any(p.replace("+", "") in digits for p in (cfg.get("drop_intl_prefixes") or []) if p):
-                stats["dropped_intl_only"] += 1
-                reason = "仅国际号"
-            else:
-                stats["dropped_no_mobile"] += 1
-                reason = "无有效手机"
-            if len(dropped_samples) < 8:
+            kind = classify_unusable(raw_join, cfg)
+            stat_key, reason = {
+                "empty": ("dropped_no_mobile", "无手机号"),
+                "landline": ("dropped_landline_only", "仅座机"),
+                "intl": ("dropped_intl_only", "仅国际号"),
+                "invalid": ("dropped_invalid", "无效号码"),
+            }[kind]
+            stats[stat_key] += 1
+            if len(dropped_samples) < 12:
                 dropped_samples.append({"公司名称": company, "原始电话": _clean_text(raw_join)[:40], "原因": reason})
             continue
 
-        # 验收：至少公司名 + 有效常用电话
         if not company:
-            stats["dropped_no_mobile"] += 1
+            stats["dropped_no_company"] += 1
             if len(dropped_samples) < 12:
-                dropped_samples.append({"公司名称": "(空)", "原始电话": mobiles[0] if mobiles else "", "原因": "缺公司名称"})
+                dropped_samples.append({"公司名称": "(空)", "原始电话": mobiles[0], "原因": "缺公司名称"})
             continue
 
         # 公司名去重
