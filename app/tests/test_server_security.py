@@ -83,7 +83,7 @@ class GuardTest(unittest.TestCase):
         self.assertEqual(self.req("GET", "/api/health", {"Sec-Fetch-Site": "same-origin"})[0], 200)
 
     def test_export_outside_home_rejected(self):
-        with mock.patch.dict(server._STATE, {"last_result": {"rows": None, "stats": {}}}):
+        with mock.patch.dict(server.get_state("default"), {"last_result": {"rows": None, "stats": {}}}):
             st, data = self.req("POST", "/api/export", {"Content-Type": "application/json"},
                                 body=json.dumps({"output_dir": "/etc/cron.d"}))
         self.assertEqual(st, 400)

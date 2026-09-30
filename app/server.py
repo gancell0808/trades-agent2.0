@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import webbrowser
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -138,14 +139,42 @@ APP_CFG = load_app_config()
 HOST = str(APP_CFG["server"].get("host") or "127.0.0.1")
 PORT = int(os.environ.get("TRADES_PORT") or APP_CFG["server"].get("port") or 8787)
 
-_STATE: dict = {
-    "dfs": [],           # list[DataFrame]
-    "filenames": [],
-    "source": "自定义",
-    "mapping": {},
-    "last_result": None,
-    "last_export": None,  # {"files": [], "stats": {}}
-}
+# 每个浏览器标签页一个独立会话（前端在 X-Session-Id 头里带 ID），互不覆盖。
+MAX_SESSIONS = 8
+_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_SESSIONS: "OrderedDict[str, dict]" = OrderedDict()
+_SESSIONS_LOCK = threading.Lock()
+
+
+def _new_state() -> dict:
+    return {
+        "lock": threading.RLock(),   # 同一会话内的请求串行执行
+        "dfs": [],
+        "filenames": [],
+        "source": "自定义",
+        "mapping": {},
+        "df_merged": None,
+        "last_result": None,
+        "last_export": None,  # {"files": [], "stats": {}}
+    }
+
+
+def get_state(sid: str | None) -> dict:
+    """按会话 ID 取状态；ID 缺失/非法时用 default。超过上限淘汰最久未用的会话。"""
+    sid = sid if sid and _SID_RE.match(sid) else "default"
+    with _SESSIONS_LOCK:
+        st = _SESSIONS.get(sid)
+        if st is None:
+            st = _SESSIONS[sid] = _new_state()
+        _SESSIONS.move_to_end(sid)
+        while len(_SESSIONS) > MAX_SESSIONS:
+            _SESSIONS.popitem(last=False)
+        return st
+
+
+# 需要读写会话状态的接口（执行期间持有该会话的锁）
+_STATEFUL_POST = {"/api/upload", "/api/upload_b", "/api/clean", "/api/clean/run", "/api/export",
+                  "/api/agent/run", "/api/llm/validate"}
 
 
 def _safe_output_dir(raw: str) -> Path:
@@ -173,8 +202,18 @@ def _safe_filename(name: str, default: str = "清洗结果") -> str:
 class Handler(BaseHTTPRequestHandler):
     server_version = "TradeSClean/0.3"
 
+    _st_cache: dict | None = None
+
+    @property
+    def st(self) -> dict:
+        """本次请求所属会话的状态（每个请求只解析一次，避免中途被淘汰后重建）。"""
+        if self._st_cache is None:
+            self._st_cache = get_state(self.headers.get("X-Session-Id"))
+        return self._st_cache
+
     def _guard(self) -> bool:
         """校验 Host / Origin / Sec-Fetch-Site，防 DNS 重绑定与跨站请求（CSRF）。"""
+        self._st_cache = None
         port = self.server.server_address[1]
         allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         host = (self.headers.get("Host") or "").strip().lower()
@@ -230,7 +269,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "对话不存在"}, 404)
             return self._json({"session": item})
         if path.startswith("/api/clean/download/"):
-            return self._download(path.split("/api/clean/download/", 1)[1])
+            with self.st["lock"]:
+                return self._download(path.split("/api/clean/download/", 1)[1])
         if path in ("/", "/index.html"):
             return self._file(STATIC / "index.html", "text/html; charset=utf-8")
         if path.startswith("/static/"):
@@ -287,6 +327,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/llm/validate": self._llm_validate,
             }
             if path in routes:
+                if path in _STATEFUL_POST:
+                    with self.st["lock"]:
+                        return routes[path]()
                 return routes[path]()
             return self._json({"error": "not found"}, 404)
         except Exception as e:
@@ -323,13 +366,14 @@ class Handler(BaseHTTPRequestHandler):
         source = suggest_source(" ".join(names), columns)
 
         if slot == "df":
-            _STATE["dfs"] = frames
-            _STATE["filenames"] = names
-            _STATE["mapping"] = mapping
-            _STATE["source"] = source
-            _STATE["last_result"] = None
-            _STATE["last_export"] = None
-        _STATE[f"{slot}_merged"] = merged
+            st = self.st
+            st["dfs"] = frames
+            st["filenames"] = names
+            st["mapping"] = mapping
+            st["source"] = source
+            st["last_result"] = None
+            st["last_export"] = None
+        self.st[f"{slot}_merged"] = merged
 
         sample = merged.head(8).astype(str).fillna("").to_dict(orient="records")
         return self._json({
@@ -344,16 +388,16 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _clean(self):
-        merged = _STATE.get("df_merged")
+        merged = self.st.get("df_merged")
         if merged is None or merged.empty:
             return self._json({"error": "请先上传表格"}, 400)
         payload = json.loads(self._read_body().decode("utf-8") or "{}") or {}
-        mapping = payload.get("mapping") or _STATE.get("mapping") or {}
-        source = payload.get("source") or _STATE.get("source") or "自定义"
+        mapping = payload.get("mapping") or self.st.get("mapping") or {}
+        source = payload.get("source") or self.st.get("source") or "自定义"
         cleaning = {**load_cleaning_config(CONFIG_PATH), **(payload.get("cleaning") or {})}
 
         result = run_maibang_clean(merged, mapping, source=source, cleaning=cleaning)
-        _STATE["last_result"] = result
+        self.st["last_result"] = result
 
         rows = result["rows"]
         preview = rows.head(20).astype(str).fillna("").to_dict(orient="records")
@@ -363,16 +407,16 @@ class Handler(BaseHTTPRequestHandler):
             "columns": cols,
             "preview": preview,
             "source": source,
-            "filename": " + ".join(_STATE.get("filenames") or []),
+            "filename": " + ".join(self.st.get("filenames") or []),
             "sheets": ["清洗结果"],
         })
 
     def _export(self):
-        result = _STATE.get("last_result")
+        result = self.st.get("last_result")
         if not result:
             return self._json({"error": "请先执行清洗"}, 400)
         payload = json.loads(self._read_body().decode("utf-8") or "{}") or {}
-        source = _safe_filename(payload.get("source") or _STATE.get("source") or "自定义", "自定义")
+        source = _safe_filename(payload.get("source") or self.st.get("source") or "自定义", "自定义")
         split_rows = int(payload.get("split_rows") or load_cleaning_config(CONFIG_PATH).get("split_rows") or 1500)
         out_dir = payload.get("output_dir") or load_cleaning_config(CONFIG_PATH).get("output_dir") or str(OUT_DEFAULT)
         try:
@@ -382,8 +426,8 @@ class Handler(BaseHTTPRequestHandler):
 
         base_name = f"{source}_清洗结果"
         written = split_and_export(result["rows"], out_dir_p, base_name, split_rows=split_rows)
-        _STATE["last_export"] = written
-        _STATE["last_export"]["stats"] = result["stats"]
+        self.st["last_export"] = written
+        self.st["last_export"]["stats"] = result["stats"]
 
         # 同时提供浏览器下载主文件
         main_path = Path(written["main"])
@@ -403,7 +447,7 @@ class Handler(BaseHTTPRequestHandler):
     def _download(self, token: str):
         # 简单 token：文件名编码
         name = unquote(token)
-        last = _STATE.get("last_export") or {}
+        last = self.st.get("last_export") or {}
         for fp in last.get("files") or []:
             p = Path(fp)
             if p.name == name:
@@ -419,7 +463,7 @@ class Handler(BaseHTTPRequestHandler):
     # -------- agent / qa --------
 
     def _agent_run(self):
-        merged = _STATE.get("df_merged")
+        merged = self.st.get("df_merged")
         if merged is None or merged.empty:
             return self._json({"error": "请先上传表格"}, 400)
         payload = json.loads(self._read_body().decode("utf-8") or "{}") or {}
@@ -429,13 +473,13 @@ class Handler(BaseHTTPRequestHandler):
         out = run_agent(
             merged,
             instruction,
-            source=_STATE.get("source") or "自定义",
-            mapping=payload.get("mapping") or _STATE.get("mapping"),
+            source=self.st.get("source") or "自定义",
+            mapping=payload.get("mapping") or self.st.get("mapping"),
             use_llm=bool(payload.get("use_llm", True)),
             cleaning=payload.get("cleaning") if isinstance(payload.get("cleaning"), dict) else None,
         )
         cleaned = out.get("cleaned") or {}
-        _STATE["last_result"] = cleaned
+        self.st["last_result"] = cleaned
         return self._json({
             "steps": out.get("steps"),
             "intent": out.get("intent"),
@@ -697,7 +741,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": str(e)}, 502)
 
     def _llm_validate(self):
-        result = _STATE.get("last_result")
+        result = self.st.get("last_result")
         if not result:
             return self._json({"error": "请先执行清洗"}, 400)
         rows = result["rows"]

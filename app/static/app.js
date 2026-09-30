@@ -2,6 +2,34 @@
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+/* 每个标签页一个会话 ID：后端按它隔离上传数据与清洗结果，多标签页互不覆盖 */
+const SESSION_ID = (() => {
+  const gen = () =>
+    (window.crypto && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}${Math.random().toString(36).slice(2)}`)
+      .replace(/[^A-Za-z0-9_-]/g, "")
+      .slice(0, 64);
+  try {
+    let id = sessionStorage.getItem("trades_sid");
+    if (!id) {
+      id = gen();
+      sessionStorage.setItem("trades_sid", id);
+    }
+    return id;
+  } catch (e) {
+    return gen();
+  }
+})();
+const _rawFetch = window.fetch.bind(window);
+window.fetch = (input, init) => {
+  const url = typeof input === "string" ? input : (input && input.url) || "";
+  if (url.startsWith("/api/") || url.startsWith(location.origin + "/api/")) {
+    const headers = new Headers((init && init.headers) || (typeof input !== "string" && input.headers) || {});
+    headers.set("X-Session-Id", SESSION_ID);
+    init = { ...(init || {}), headers };
+  }
+  return _rawFetch(input, init);
+};
+
 const FIELD_LABELS = [
   { key: "company_name", label: "公司名称", required: true },
   { key: "contact_name", label: "姓名" },
