@@ -15,7 +15,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-CONFIG_PATH = Path(__file__).resolve().parent / "llm_config.json"
+CONFIG_PATH = Path(os.environ.get("TRADES_LLM_CONFIG") or Path(__file__).resolve().parent / "llm_config.json")
 
 # 单条模型方案字段
 PROFILE_FIELDS = (
@@ -162,8 +162,12 @@ def _normalize_profile(p: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
-def load_store() -> dict[str, Any]:
-    """读取完整配置仓（多方案）。兼容旧单配置格式。"""
+def load_store(apply_env: bool = True) -> dict[str, Any]:
+    """读取完整配置仓（多方案）。兼容旧单配置格式。
+
+    apply_env=True 时环境变量覆盖仅作用于内存中的结果；
+    要回写磁盘的流程必须用 apply_env=False，避免把环境变量里的 Key 写进文件。
+    """
     store = _default_store()
     if CONFIG_PATH.is_file():
         try:
@@ -187,6 +191,9 @@ def load_store() -> dict[str, Any]:
     if store.get("active_id") not in store["profiles"]:
         store["active_id"] = next(iter(store["profiles"]), "deepseek")
 
+    if not apply_env:
+        return store
+
     # 环境变量覆盖当前激活方案
     active = store["profiles"][store["active_id"]]
     if not active.get("api_key"):
@@ -196,6 +203,26 @@ def load_store() -> dict[str, Any]:
     if os.environ.get("TRADES_LLM_MODEL"):
         active["model"] = os.environ["TRADES_LLM_MODEL"]
     return store
+
+
+def _write_private(path: Path, text: str) -> None:
+    """原子写入并将权限设为 600（仅所有者可读写；Windows 上 chmod 基本无效但无害）。"""
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
 
 
 def save_store(store: dict[str, Any]) -> dict[str, Any]:
@@ -209,7 +236,7 @@ def save_store(store: dict[str, Any]) -> dict[str, Any]:
         payload = _default_store()
     if payload["active_id"] not in payload["profiles"]:
         payload["active_id"] = next(iter(payload["profiles"]))
-    CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_private(CONFIG_PATH, json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
 
 
@@ -223,7 +250,7 @@ def load_config() -> dict[str, Any]:
 
 def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """按旧接口保存到当前激活方案。"""
-    store = load_store()
+    store = load_store(apply_env=False)
     active_id = store["active_id"]
     merged = _normalize_profile({**store["profiles"][active_id], **cfg})
     if cfg.get("clear_key"):
@@ -236,7 +263,7 @@ def save_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def upsert_profile(profile_id: str, data: dict[str, Any], activate: bool = True) -> dict[str, Any]:
-    store = load_store()
+    store = load_store(apply_env=False)
     pid = (profile_id or "").strip() or "custom"
     base = store["profiles"].get(pid, dict(DEFAULT_PROFILE))
     merged = _normalize_profile({**base, **{k: data[k] for k in PROFILE_FIELDS if k in data}})
@@ -254,7 +281,7 @@ def upsert_profile(profile_id: str, data: dict[str, Any], activate: bool = True)
 
 
 def delete_profile(profile_id: str) -> dict[str, Any]:
-    store = load_store()
+    store = load_store(apply_env=False)
     pid = str(profile_id)
     if pid not in store["profiles"]:
         raise ValueError("方案不存在")
@@ -268,7 +295,7 @@ def delete_profile(profile_id: str) -> dict[str, Any]:
 
 
 def set_active(profile_id: str) -> dict[str, Any]:
-    store = load_store()
+    store = load_store(apply_env=False)
     pid = str(profile_id)
     if pid not in store["profiles"]:
         raise ValueError("方案不存在")

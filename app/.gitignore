@@ -4,3 +4,4 @@ qa_sessions.json
 _test_export.xlsx
 __pycache__/
 *.pyc
+*.tmp
