@@ -173,7 +173,7 @@ def get_state(sid: str | None) -> dict:
 
 
 # 需要读写会话状态的接口（执行期间持有该会话的锁）
-_STATEFUL_POST = {"/api/upload", "/api/upload_b", "/api/clean", "/api/clean/run", "/api/export",
+_STATEFUL_POST = {"/api/upload", "/api/clean", "/api/clean/run", "/api/export",
                   "/api/agent/run", "/api/llm/validate"}
 
 
@@ -304,8 +304,7 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
         try:
             routes = {
-                "/api/upload": lambda: self._upload(slot="df"),
-                "/api/upload_b": lambda: self._upload(slot="df_b"),
+                "/api/upload": self._upload,
                 "/api/clean": self._clean,
                 "/api/clean/run": self._clean,
                 "/api/export": self._export,
@@ -317,7 +316,6 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/qa/session/save": self._qa_save,
                 "/api/qa/session/delete": self._qa_delete,
                 "/api/qa/sessions/clear": self._qa_clear,
-                "/api/compare": self._compare,
                 "/api/llm/config": self._llm_save_config,
                 "/api/llm/profile": self._llm_save_profile,
                 "/api/llm/profile/activate": self._llm_activate,
@@ -347,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
         filename = payload.get("filename") or "pasted.csv"
         return [(filename, read_table(raw.encode("utf-8"), filename))]
 
-    def _upload(self, slot: str = "df"):
+    def _upload(self):
         items = self._parse_upload()
         if not items:
             return self._json({"error": "未读到文件"}, 400)
@@ -365,15 +363,14 @@ class Handler(BaseHTTPRequestHandler):
         mapping = auto_map_columns(columns)
         source = suggest_source(" ".join(names), columns)
 
-        if slot == "df":
-            st = self.st
-            st["dfs"] = frames
-            st["filenames"] = names
-            st["mapping"] = mapping
-            st["source"] = source
-            st["last_result"] = None
-            st["last_export"] = None
-        self.st[f"{slot}_merged"] = merged
+        st = self.st
+        st["dfs"] = frames
+        st["filenames"] = names
+        st["mapping"] = mapping
+        st["source"] = source
+        st["last_result"] = None
+        st["last_export"] = None
+        st["df_merged"] = merged
 
         sample = merged.head(8).astype(str).fillna("").to_dict(orient="records")
         return self._json({
@@ -679,9 +676,6 @@ class Handler(BaseHTTPRequestHandler):
         n = qa_store.clear_all()
         return self._json({"ok": True, "removed": n, "sessions": []})
 
-    def _compare(self):
-        return self._json({"error": "当前版本请用「清洗去重」覆盖重复公司"}, 400)
-
     # -------- llm --------
 
     def _llm_save_config(self):
@@ -774,7 +768,7 @@ def _parse_multipart_multi(body: bytes, ctype: str):
         if b"Content-Disposition" not in part:
             continue
         header, _, data = part.partition(b"\r\n\r\n")
-        if b'name="file"' not in header and b'name="files"' not in header and b'name="file_b"' not in header:
+        if b'name="file"' not in header and b'name="files"' not in header:
             continue
         fn = re.search(rb'filename="([^"]+)"', header)
         filename = fn.group(1).decode("utf-8", errors="replace") if fn else "upload.xlsx"

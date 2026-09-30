@@ -78,6 +78,11 @@ class Isolation(unittest.TestCase):
         [t.join() for t in ts]
         self.assertEqual(results, [200] * 6)
 
+    def test_removed_legacy_endpoints_are_gone(self):
+        for path in ("/api/upload_b", "/api/compare"):
+            st, _ = self.post(path, "{}", "tabA")
+            self.assertEqual(st, 404, path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,11 +48,9 @@ const FIELD_LABELS = [
 
 const state = {
   mapping: {},
-  mappingB: null,
   columns: [],
   source: "其他",
   filename: "",
-  hasB: false,
   view: "home",
   qaSessionId: null,
   qaRoleId: "clean",
