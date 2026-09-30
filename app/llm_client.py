@@ -30,6 +30,7 @@ PROFILE_FIELDS = (
     "temperature",
     "max_tokens",
     "extra_headers",
+    "ssl_verify",
 )
 
 DEFAULT_PROFILE: dict[str, Any] = {
@@ -44,6 +45,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
     "temperature": 0.1,
     "max_tokens": 2000,
     "extra_headers": {},
+    "ssl_verify": True,  # 默认严格校验证书；仅用户显式关闭时才跳过
 }
 
 PRESETS: list[dict[str, Any]] = [
@@ -123,6 +125,14 @@ def _default_store() -> dict[str, Any]:
     }
 
 
+def _as_bool(v: Any, default: bool = True) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(v)
+
+
 def _normalize_profile(p: dict[str, Any] | None) -> dict[str, Any]:
     out = dict(DEFAULT_PROFILE)
     if isinstance(p, dict):
@@ -131,6 +141,7 @@ def _normalize_profile(p: dict[str, Any] | None) -> dict[str, Any]:
                 out[k] = p[k]
     if not isinstance(out.get("extra_headers"), dict):
         out["extra_headers"] = {}
+    out["ssl_verify"] = _as_bool(out.get("ssl_verify"), True)
     out["timeout"] = int(out.get("timeout") or 60)
     out["batch_size"] = int(out.get("batch_size") or 8)
     try:
@@ -326,20 +337,18 @@ def _make_ssl_context(verify: bool = True):
 
 
 def _http_post_json(url: str, payload: dict, headers: dict, timeout: int, verify: bool = True) -> dict:
-    import ssl
-    import urllib.error
-    import urllib.request
+    """POST JSON。证书校验完全由 verify 决定，绝不自动降级为不校验。
 
+    网络类错误（非 HTTP 状态错误）会再试一次「不走系统代理」，
+    该重试沿用同样的 verify 设置。
+    """
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    last_err: Exception | None = None
+    ctx = _make_ssl_context(verify=verify)
 
-    def once(use_verify: bool) -> dict:
-        nonlocal last_err
-        ctx = _make_ssl_context(verify=use_verify)
-        handlers = []
+    def once(use_proxy: bool) -> dict:
+        handlers: list = [] if use_proxy else [urllib.request.ProxyHandler({})]
         if url.startswith("https://"):
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
-        # 尊重系统代理；失败再试直连
         opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
@@ -348,37 +357,20 @@ def _http_post_json(url: str, payload: dict, headers: dict, timeout: int, verify
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise ValueError(f"大模型接口 HTTP {e.code}: {body[:300]}") from e
-        except Exception as e:
-            last_err = e
-            raise
 
     try:
-        return once(verify)
+        return once(use_proxy=True)
     except ValueError:
         raise
     except Exception as e1:
-        # SSL/网络异常：先关闭证书校验再试一次（常见于公司代理 MITM）
-        if verify and ("SSL" in str(e1) or "EOF" in str(e1) or "certificate" in str(e1).lower()):
+        last_err: Exception = e1
+        if not _is_tls_error(e1):
             try:
-                return once(False)
+                return once(use_proxy=False)
             except ValueError:
                 raise
             except Exception as e2:
                 last_err = e2
-        # 再尝试不走代理（有些环境代理会掐断 TLS）
-        try:
-            import urllib.request as ur
-
-            proxy_handler = ur.ProxyHandler({})
-            ctx = _make_ssl_context(verify=False)
-            opener = ur.build_opener(proxy_handler, ur.HTTPSHandler(context=ctx))
-            req = ur.Request(url, data=data, headers=headers, method="POST")
-            with opener.open(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except ValueError:
-            raise
-        except Exception as e3:
-            last_err = e3
 
     msg = str(last_err)
     if "getaddrinfo" in msg or "Name or service" in msg or "11001" in msg:
@@ -387,14 +379,25 @@ def _http_post_json(url: str, payload: dict, headers: dict, timeout: int, verify
             "正确示例：https://api.deepseek.com/v1 或 https://api.xiaomimimo.com/v1"
             f"详情：{msg[:160]}"
         )
-    if "SSL" in msg or "EOF" in msg or "certificate" in msg.lower():
+    if _is_tls_error(last_err):
         raise ValueError(
-            "无法连接大模型接口（TLS/SSL 被中断）。"
-            "常见原因：公司代理/防火墙拦截 HTTPS、网络不稳。"
-            "可尝试：1) 切换网络或关代理 2) 本地 Ollama。"
+            "TLS 证书校验失败，已拒绝连接（未发送 API Key 以外的降级请求）。"
+            "可能是公司代理/防火墙替换了证书，或网络被劫持。"
+            "如确认网络可信（如公司代理），可在「大模型设置 → 高级」中关闭证书校验；"
+            "也可切换网络或改用本地 Ollama。"
             f"详情：{msg[:180]}"
         )
     raise ValueError(f"无法连接大模型接口：{msg[:200]}")
+
+
+def _is_tls_error(e: BaseException) -> bool:
+    import ssl
+
+    reason = getattr(e, "reason", e)
+    if isinstance(reason, ssl.SSLError):
+        return True
+    m = str(e)
+    return "SSL" in m or "CERTIFICATE" in m.upper()
 
 
 def chat(messages: list[dict[str, str]], cfg: dict[str, Any] | None = None) -> str:
@@ -428,7 +431,7 @@ def chat(messages: list[dict[str, str]], cfg: dict[str, Any] | None = None) -> s
         headers.pop("Authorization", None)
 
     timeout = int(cfg.get("timeout") or 60)
-    verify = bool(cfg.get("ssl_verify", True))
+    verify = _as_bool(cfg.get("ssl_verify"), True)
     data = _http_post_json(url, payload, headers, timeout, verify=verify)
 
     try:
@@ -471,7 +474,7 @@ def chat_stream(messages: list[dict[str, str]], cfg: dict[str, Any] | None = Non
     import urllib.request
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    ctx = _make_ssl_context(verify=bool(cfg.get("ssl_verify", True)))
+    ctx = _make_ssl_context(verify=_as_bool(cfg.get("ssl_verify"), True))
     handlers = [urllib.request.HTTPSHandler(context=ctx)] if url.startswith("https://") else []
     opener = urllib.request.build_opener(*handlers)
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")

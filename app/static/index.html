@@ -538,6 +538,15 @@
               <div class="label">temperature</div>
               <input id="llm-temp" type="number" min="0" max="2" step="0.1" value="0.1" />
             </div>
+            <div class="map-item" style="grid-column:1/-1">
+              <label style="display:flex;gap:8px;align-items:center">
+                <input id="llm-ssl-off" type="checkbox" />
+                <span>关闭 HTTPS 证书校验（不安全）</span>
+              </label>
+              <div id="llm-ssl-warn" class="hidden" style="color:#d9480f;font-size:12px;margin-top:4px">
+                ⚠ 已关闭证书校验：API Key 可能被中间人截获。仅在确认网络可信（如公司代理）时使用。
+              </div>
+            </div>
           </div>
         </details>
 

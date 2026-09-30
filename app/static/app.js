@@ -293,7 +293,17 @@ function fillLlmForm(profile, id) {
   if (timeout) timeout.value = profile?.timeout || 60;
   const temp = $("#llm-temp");
   if (temp) temp.value = profile?.temperature ?? 0.1;
+  const sslOff = $("#llm-ssl-off");
+  if (sslOff) {
+    sslOff.checked = profile?.ssl_verify === false;
+    syncSslWarn();
+  }
 }
+
+function syncSslWarn() {
+  $("#llm-ssl-warn")?.classList.toggle("hidden", !$("#llm-ssl-off")?.checked);
+}
+$("#llm-ssl-off")?.addEventListener("change", syncSslWarn);
 
 function renderVendors(store) {
   const box = $("#llm-vendors");
@@ -394,6 +404,7 @@ function collectLlmProfile() {
     batch_size: 8,
     max_tokens: 2000,
     extra_headers: {},
+    ssl_verify: !$("#llm-ssl-off")?.checked,
   };
 }
 

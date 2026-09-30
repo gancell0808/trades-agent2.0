@@ -683,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
             cfg = dict(store["profiles"][pid])
         else:
             cfg = llm_client.load_config()
-        for k in ("base_url", "model", "chat_path", "api_style", "temperature", "max_tokens", "extra_headers"):
+        for k in ("base_url", "model", "chat_path", "api_style", "temperature", "max_tokens", "extra_headers", "ssl_verify"):
             if payload.get(k) is not None:
                 cfg[k] = payload[k]
         if payload.get("api_key"):
