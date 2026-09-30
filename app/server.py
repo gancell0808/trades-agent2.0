@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import llm_client
+from web_search import web_search_ex
 from agent_core import local_qa_answer, run_agent
 import qa_store
 from clean_engine import (
@@ -39,82 +40,6 @@ QA_SYSTEM = """你是公司内部「数据清洗与线索整理」助手，服�
 按公司名称去重；删除无手机号记录；导出列为某公司模板。
 禁止编造清洗条数与路径；不确定写「待核实」；不泄露 Key。
 回答中文、简洁、可执行。"""
-
-
-def web_search(query: str, limit: int = 5) -> list[dict]:
-    """从公开搜索引擎抓取标题/链接/摘要（尽力而为）。"""
-    import re
-    import urllib.parse
-    import urllib.request
-
-    q = urllib.parse.quote(query)
-    candidates = [
-        f"https://www.bing.com/search?q={q}&setlang=zh-CN",
-        f"https://html.duckduckgo.com/html/?q={q}",
-    ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    }
-    for url in candidates:
-        try:
-            req = urllib.request.Request(url, headers=headers, method="GET")
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                html = resp.read().decode("utf-8", errors="replace")
-            results: list[dict] = []
-            if "bing" in url:
-                blocks = re.split(r'<li class="b_algo"', html, flags=re.I)[1:]
-                for block in blocks:
-                    tm = re.search(r'<a class="tilk"[^>]*href="([^"]+)"', block, re.I)
-                    if tm:
-                        link = tm.group(1)
-                        label = re.search(r'aria-label="([^"]*)"', block, re.I)
-                        title = label.group(1) if label else ""
-                    else:
-                        hm = re.search(r'<h2>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.S | re.I)
-                        if not hm:
-                            continue
-                        link, title = hm.group(1), hm.group(2)
-                    if link.startswith("/"):
-                        link = "https://www.bing.com" + link
-                    if not link.startswith("http"):
-                        continue
-                    sm = re.search(r'<p[^>]*>(.*?)</p>', block, re.S | re.I)
-                    if not sm:
-                        sm = re.search(r'class="b_caption"[^>]*>(.*?)</div>', block, re.S | re.I)
-                    snippet = re.sub(r"<[^>]+>", " ", sm.group(1) if sm else "")
-                    snippet = re.sub(r"\s+", " ", snippet)[:220].strip()
-                    title = re.sub(r"<[^>]+>", "", title or "").strip()
-                    h2 = re.search(r"<h2[^>]*>\s*<a[^>]*>(.*?)</a>", block, re.S | re.I)
-                    if h2:
-                        t2 = re.sub(r"<[^>]+>", "", h2.group(1)).strip()
-                        if t2:
-                            title = t2
-                    if not title:
-                        title = urllib.parse.urlparse(link).netloc
-                    results.append({"title": title[:80], "url": link, "snippet": snippet})
-                    if len(results) >= limit:
-                        break
-            else:
-                for m in re.finditer(
-                    r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</',
-                    html,
-                    re.S | re.I,
-                ):
-                    link, title, snippet = m.group(1), m.group(2), m.group(3)
-                    title = re.sub(r"<[^>]+>", "", title)[:80]
-                    snippet = re.sub(r"<[^>]+>", "", snippet)[:220]
-                    if "uddg=" in link:
-                        link = urllib.parse.unquote(link.split("uddg=")[-1].split("&")[0])
-                    if title and link:
-                        results.append({"title": title, "url": link, "snippet": snippet})
-                    if len(results) >= limit:
-                        break
-            if results:
-                return results
-        except Exception:
-            continue
-    return []
 
 
 def load_app_config() -> dict:
@@ -521,8 +446,11 @@ class Handler(BaseHTTPRequestHandler):
         q = (payload.get("query") or "").strip()
         if not q:
             return self._json({"error": "请输入搜索词"}, 400)
-        results = web_search(q, limit=int(payload.get("limit") or 5))
-        return self._json({"ok": True, "query": q, "results": results, "count": len(results)})
+        results, errors = web_search_ex(q, limit=int(payload.get("limit") or 5))
+        out = {"ok": bool(results), "query": q, "results": results, "count": len(results)}
+        if not results:
+            out["error"] = "联网搜索未获得结果：" + "；".join(errors)
+        return self._json(out)
 
     def _qa_upload(self):
         """附件上传：提取文本内容，供问答引用。"""
@@ -559,7 +487,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         return self._json({"ok": True, "files": [{"filename": f["filename"], "chars": f["chars"], "preview": f["preview"]} for f in files], "contents": files})
 
-    def _build_qa_messages(self, payload: dict) -> list:
+    def _build_qa_messages(self, payload: dict) -> tuple[list, str]:
+        """返回 (消息列表, 联网搜索提示)。提示非空表示已开启联网但没有拿到结果。"""
         question = (payload.get("question") or "").strip()
         history = payload.get("history") or []
         role = payload.get("role") or "clean"
@@ -579,8 +508,12 @@ class Handler(BaseHTTPRequestHandler):
             r = "assistant" if h.get("role") == "bot" else "user"
             msgs.append({"role": r, "content": str(h.get("text") or "")[:500]})
         user_content = question
+        web_notice = ""
         if use_web and question:
-            hits = web_search(question, limit=5)
+            hits, errors = web_search_ex(question, limit=5)
+            if not hits:
+                web_notice = "⚠ 联网搜索未获得结果（" + "；".join(errors) + "），以下回答未使用联网信息。\n\n"
+                msgs[0]["content"] += "\n本次联网搜索失败，没有检索结果：请在回答开头说明这一点，不要编造来源或链接。"
             if hits:
                 lines = ["【联网检索结果】"]
                 for i, h in enumerate(hits, 1):
@@ -592,7 +525,7 @@ class Handler(BaseHTTPRequestHandler):
                 parts.append(f"【附件 {a.get('filename', 'file')}】\n{str(a.get('content') or a.get('preview') or '')[:4000]}")
             user_content = ("\n\n".join(parts) + "\n\n用户问题：" + user_content) if user_content else "\n\n".join(parts)
         msgs.append({"role": "user", "content": user_content[:8000]})
-        return msgs
+        return msgs, web_notice
 
     def _qa_stream(self):
         """SSE 流式问答（HTTP chunked）。"""
@@ -624,8 +557,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         emit({"type": "meta", "ok": True})
-        msgs = self._build_qa_messages(payload)
+        msgs, web_notice = self._build_qa_messages(payload)
         full: list[str] = []
+        if web_notice:
+            full.append(web_notice)
+            emit({"type": "content", "content": web_notice})
         try:
             cfg = llm_client.load_config()
             has_llm = bool(cfg.get("api_key")) or "127.0.0.1" in str(cfg.get("base_url", "")) or "localhost" in str(cfg.get("base_url", ""))
