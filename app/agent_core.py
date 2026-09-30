@@ -14,7 +14,9 @@ import pandas as pd
 
 from clean_engine import (
     DEFAULT_CLEANING,
+    MOBILE_SLOTS,
     auto_map_columns,
+    load_cleaning_config,
     run_maibang_clean,
 )
 import llm_client
@@ -85,7 +87,7 @@ def parse_intent_rules(instruction: str) -> dict[str, Any]:
         extract_core = True
 
     # 电话
-    if re.search(r"\+?86|0086|去掉.?前缀", text):
+    if re.search(r"\+86|(?<!\d)0086(?!\d)|(?<!\d)86(?=前缀|开头)|去掉.?前缀", text):
         opt["strip_86"] = True
     if re.search(r"只保留?.{0,6}手机|去掉座机|去除座机|只要手机", text):
         opt["mobile_only"] = True
@@ -115,8 +117,8 @@ def parse_intent_rules(instruction: str) -> dict[str, Any]:
         opt["split_by_phone_count"] = True
 
     # 按条数拆
-    m = re.search(r"(\d+)\s*条", text)
-    if m and re.search(r"拆|分", text):
+    m = re.search(r"(?:每|各|约|拆成?|分成?)[^\d，,。]{0,8}?(\d+)\s*条", text)
+    if m:
         chunk_size = int(m.group(1))
         opt["chunk_size"] = chunk_size
 
@@ -127,7 +129,7 @@ def parse_intent_rules(instruction: str) -> dict[str, Any]:
     # 质量 / 验证
     if re.search(r"质量|分析一下|数据质量|怎么样", text):
         want_quality = True
-    if re.search(r"大模型|AI|智能校验|用模型", text):
+    if re.search(r"大模型|(?<![A-Za-z])AI(?![A-Za-z])|智能校验|用模型", text, re.I):
         want_ai = True
 
     # 全流程组合指令
@@ -316,6 +318,58 @@ def local_qa_answer(question: str) -> str:
     )
 
 
+def unsupported_requests(plan_info: dict[str, Any]) -> list[str]:
+    """指令里提到、但当前清洗流程尚未实现的能力（如实告知，不悄悄忽略）。"""
+    opt = plan_info.get("options") or {}
+    out: list[str] = []
+    if plan_info.get("extract_core") or opt.get("extract_core"):
+        out.append("只提取部分字段（输出固定为某公司 18 列模板）")
+    if plan_info.get("split_name") or opt.get("split_by_name"):
+        out.append("按公司名称中/英文分表")
+    if plan_info.get("split_phone") or opt.get("split_by_phone_count"):
+        out.append("按手机号数量分表")
+    chunk = int(plan_info.get("chunk_size") or opt.get("chunk_size") or 0)
+    if chunk:
+        out.append(f"按每表 {chunk} 条拆分（请在导出时设置「每表条数」）")
+    return out
+
+
+def verify_cleaned(rows: pd.DataFrame, cfg: dict[str, Any], mapping: dict[str, str]) -> dict[str, Any]:
+    """对清洗结果做真实检查，返回 {ok, problems, checks}。"""
+    problems: list[str] = []
+    checks: list[str] = []
+    if not mapping.get("company_name"):
+        problems.append("未识别到公司名称列")
+    if not mapping.get("mobile"):
+        problems.append("未识别到手机/电话列")
+    n = len(rows)
+    if n == 0:
+        problems.append("清洗后没有任何有效记录")
+        return {"ok": False, "problems": problems, "checks": checks}
+
+    pat = re.compile(cfg.get("mobile_pattern") or r"^1\d{10}$")
+    slots = [c for c in (cfg.get("mobile_slots") or MOBILE_SLOTS) if c in rows.columns]
+    bad = 0
+    for c in slots:
+        bad += sum(1 for v in rows[c].astype(str).str.strip() if v and not pat.fullmatch(v))
+    if bad:
+        problems.append(f"{bad} 个电话不符合手机号规则")
+    else:
+        checks.append("电话均符合手机号规则")
+
+    if "常用电话" in rows.columns and int((rows["常用电话"].astype(str).str.strip() == "").sum()):
+        problems.append("存在常用电话为空的记录")
+    names = rows["公司名称"].astype(str).str.strip()
+    if int((names == "").sum()):
+        problems.append("存在公司名称为空的记录")
+    dup = int(names.duplicated().sum())
+    if dup:
+        problems.append(f"公司名称仍有 {dup} 条重复")
+    else:
+        checks.append("公司名称无重复")
+    return {"ok": not problems, "problems": problems, "checks": checks}
+
+
 def run_agent(
     df: pd.DataFrame,
     instruction: str,
@@ -323,10 +377,13 @@ def run_agent(
     mapping: dict[str, str] | None = None,
     use_llm: bool = True,
     max_rows: int = 0,
+    cleaning: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """执行清洗 Agent：规划 → 工具 → 自检。"""
     run = AgentRun()
     cols = list(df.columns)
+    # 与手动模式一致：config.json 的 cleaning 段 + 请求里的覆盖项
+    cfg = {**load_cleaning_config(), **(cleaning or {})}
 
     # 1) 理解与规划
     plan_info = parse_instruction(instruction, cols, use_llm=use_llm)
@@ -366,7 +423,7 @@ def run_agent(
         run.step("clean_data", "限制处理行数", f"仅处理前 {max_rows} 行", status="warn")
 
     try:
-        cleaned = run_maibang_clean(df, mp, source=source)
+        cleaned = run_maibang_clean(df, mp, source=source, cleaning=cfg)
         cleaned["sheets"] = {"清洗结果": cleaned["rows"]}
         cleaned["report"] = {
             "score": cleaned["stats"].get("valid_rate"),
@@ -390,13 +447,20 @@ def run_agent(
         payload={"stats": stats},
     )
 
-    # 5) quality_check
+    # 5) quality_check：基于真实结果检查，不再写死通过
     report = cleaned.get("report") or {}
+    verdict = verify_cleaned(cleaned["rows"], cfg, mp)
+    unsupported = unsupported_requests(plan_info)
+    if unsupported:
+        run.step("plan", "以下要求当前暂不支持，本次已忽略", "；".join(unsupported), status="warn",
+                 payload={"unsupported": unsupported})
     run.step(
         "quality_check",
-        "验收自检",
-        f"有效率 {stats.get('valid_rate')}%；手机号均为 1 开头 11 位；无座机；公司已去重；可导入某公司",
-        payload={"score": report.get("score")},
+        "验收自检" if verdict["ok"] else "验收自检：发现问题",
+        (f"有效率 {stats.get('valid_rate')}%；" + "；".join(verdict["checks"]))
+        if verdict["ok"] else "；".join(verdict["problems"]),
+        status="done" if verdict["ok"] else "warn",
+        payload={"score": report.get("score"), "problems": verdict["problems"]},
     )
 
     # 6) export_ready
@@ -414,8 +478,11 @@ def run_agent(
     # 7) self_review
     review = (
         f"自检完成：原始 {stats.get('raw_count')} 条 → 清洗后 {stats.get('cleaned_count')} 条；"
-        f"有效率 {stats.get('valid_rate')}%；已去重 {stats.get('duplicated_company')} 条重复公司。可导出。"
+        f"有效率 {stats.get('valid_rate')}%；已去重 {stats.get('duplicated_company')} 条重复公司。"
+        + ("可导出。" if verdict["ok"] else "存在问题，请先核对后再导出：" + "；".join(verdict["problems"]))
     )
+    if unsupported:
+        review += "（另有 " + str(len(unsupported)) + " 项要求暂不支持，已忽略）"
     run.step("self_review", "自检汇总", review)
 
     result = {
@@ -431,6 +498,8 @@ def run_agent(
         "cleaned": stats.get("cleaned_count"),
         "rate": stats.get("valid_rate"),
         "review": review,
+        "ok": verdict["ok"],
+        "unsupported": unsupported,
     }
 
     # 可选 AI 复盘（不阻塞主流程）

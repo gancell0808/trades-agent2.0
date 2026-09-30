@@ -432,6 +432,7 @@ class Handler(BaseHTTPRequestHandler):
             source=_STATE.get("source") or "自定义",
             mapping=payload.get("mapping") or _STATE.get("mapping"),
             use_llm=bool(payload.get("use_llm", True)),
+            cleaning=payload.get("cleaning") if isinstance(payload.get("cleaning"), dict) else None,
         )
         cleaned = out.get("cleaned") or {}
         _STATE["last_result"] = cleaned
