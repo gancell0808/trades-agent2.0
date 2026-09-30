@@ -64,8 +64,8 @@ class AgentRun(unittest.TestCase):
         txt = warn[0]["detail"]
         self.assertIn("中/英文分表", txt)
         self.assertIn("100", txt)
-        self.assertIn("只提取部分字段", txt)
-        self.assertIn("暂不支持", out["result_summary"]["review"])
+        self.assertIn("导出列固定为某公司导入模板", txt)
+        self.assertIn("未执行", out["result_summary"]["review"])
 
     def test_no_unsupported_warning_for_plain_clean(self):
         out = run_agent(DF, "帮我清洗一下", use_llm=False)

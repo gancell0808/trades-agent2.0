@@ -323,7 +323,7 @@ def unsupported_requests(plan_info: dict[str, Any]) -> list[str]:
     opt = plan_info.get("options") or {}
     out: list[str] = []
     if plan_info.get("extract_core") or opt.get("extract_core"):
-        out.append("只提取部分字段（输出固定为某公司 18 列模板）")
+        out.append("只提取部分字段：导出列固定为某公司导入模板（18 列），不做裁剪")
     if plan_info.get("split_name") or opt.get("split_by_name"):
         out.append("按公司名称中/英文分表")
     if plan_info.get("split_phone") or opt.get("split_by_phone_count"):
@@ -456,7 +456,7 @@ def run_agent(
     verdict = verify_cleaned(cleaned["rows"], cfg, mp)
     unsupported = unsupported_requests(plan_info)
     if unsupported:
-        run.step("plan", "以下要求当前暂不支持，本次已忽略", "；".join(unsupported), status="warn",
+        run.step("plan", "以下要求本次未执行（导出固定为模板，或功能尚未实现）", "；".join(unsupported), status="warn",
                  payload={"unsupported": unsupported})
     run.step(
         "quality_check",
@@ -486,7 +486,7 @@ def run_agent(
         + ("可导出。" if verdict["ok"] else "存在问题，请先核对后再导出：" + "；".join(verdict["problems"]))
     )
     if unsupported:
-        review += "（另有 " + str(len(unsupported)) + " 项要求暂不支持，已忽略）"
+        review += "（另有 " + str(len(unsupported)) + " 项要求未执行）"
     run.step("self_review", "自检汇总", review)
 
     result = {
