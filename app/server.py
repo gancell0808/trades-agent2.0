@@ -148,8 +148,48 @@ _STATE: dict = {
 }
 
 
+def _safe_output_dir(raw: str) -> Path:
+    """导出目录必须落在用户主目录内（含默认桌面\\清洗），防止任意路径写文件。"""
+    p = Path(str(raw)).expanduser()
+    if not p.is_absolute():
+        p = Path.home() / p
+    p = p.resolve()
+    home = Path.home().resolve()
+    try:
+        p.relative_to(home)
+    except ValueError:
+        raise ValueError(f"导出目录必须位于用户主目录内：{home}")
+    if p == home:
+        raise ValueError("导出目录不能直接是用户主目录，请指定子文件夹")
+    return p
+
+
+def _safe_filename(name: str, default: str = "清洗结果") -> str:
+    """去掉路径分隔符与控制字符，避免文件名穿越。"""
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", str(name or "")).strip(" .")
+    return name[:60] or default
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "TradeSClean/0.3"
+
+    def _guard(self) -> bool:
+        """校验 Host / Origin / Sec-Fetch-Site，防 DNS 重绑定与跨站请求（CSRF）。"""
+        port = self.server.server_address[1]
+        allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host not in allowed_hosts:
+            self._json({"error": "forbidden: bad host"}, 403)
+            return False
+        origin = self.headers.get("Origin")
+        if origin is not None and origin.strip().lower() not in {f"http://{h}" for h in allowed_hosts}:
+            self._json({"error": "forbidden: cross-origin request"}, 403)
+            return False
+        site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if site and site not in ("same-origin", "none"):
+            self._json({"error": "forbidden: cross-site request"}, 403)
+            return False
+        return True
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[TradeS] " + (fmt % args) + "\n")
@@ -174,6 +214,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(n) if n else b""
 
     def do_GET(self):
+        if not self._guard():
+            return
         path = unquote(urlparse(self.path).path)
         if path == "/api/health":
             return self._json({"ok": True, "port": PORT, "host": HOST})
@@ -217,6 +259,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, fp.read_bytes(), ctype)
 
     def do_POST(self):
+        if not self._guard():
+            return
         path = unquote(urlparse(self.path).path)
         try:
             routes = {
@@ -328,10 +372,13 @@ class Handler(BaseHTTPRequestHandler):
         if not result:
             return self._json({"error": "请先执行清洗"}, 400)
         payload = json.loads(self._read_body().decode("utf-8") or "{}") or {}
-        source = payload.get("source") or _STATE.get("source") or "自定义"
+        source = _safe_filename(payload.get("source") or _STATE.get("source") or "自定义", "自定义")
         split_rows = int(payload.get("split_rows") or load_cleaning_config(CONFIG_PATH).get("split_rows") or 1500)
         out_dir = payload.get("output_dir") or load_cleaning_config(CONFIG_PATH).get("output_dir") or str(OUT_DEFAULT)
-        out_dir_p = Path(out_dir).expanduser()
+        try:
+            out_dir_p = _safe_output_dir(out_dir)
+        except ValueError as e:
+            return self._json({"error": str(e)}, 400)
 
         base_name = f"{source}_清洗结果"
         written = split_and_export(result["rows"], out_dir_p, base_name, split_rows=split_rows)
@@ -359,7 +406,7 @@ class Handler(BaseHTTPRequestHandler):
         last = _STATE.get("last_export") or {}
         for fp in last.get("files") or []:
             p = Path(fp)
-            if p.name == name or fp.endswith(name):
+            if p.name == name:
                 if p.is_file():
                     return self._send(
                         200,
