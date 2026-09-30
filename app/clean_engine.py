@@ -176,53 +176,69 @@ def _clean_text(v: Any) -> str:
     return re.sub(r"\s+", " ", s)
 
 
+def _segment_mobile(seg: str, pattern: re.Pattern, strip_cc: tuple[str, ...], intl_cc: tuple[str, ...]) -> str | None:
+    """单个候选段 → 合规手机号（1 开头 11 位）或 None。前缀只在段首处理。"""
+    seg = seg.strip()
+    seg = re.sub(r"\.0+$", "", seg)          # Excel 数值遗留的 .0
+    seg = re.sub(r"[（(]\s*0\s*[)）]", "", seg)  # +86 (0)138... 中的 (0)
+    if not seg:
+        return None
+    m = re.match(r"^(\+|00)\s*(\d{1,3})", seg)
+    if m:
+        cc = m.group(2)
+        # 国家码：86 保留后续；其它（852/853/886/81/82…）一律视为国际号丢弃
+        if not any(cc.startswith(c) for c in strip_cc):
+            return None
+        seg = seg[m.end(1) + len(next(c for c in strip_cc if cc.startswith(c))):]
+    digits = re.sub(r"\D", "", seg)
+    if len(digits) == 13 and digits.startswith("86"):
+        digits = digits[2:]
+    return digits if pattern.fullmatch(digits) else None
+
+
 def extract_valid_mobiles(raw: Any, cleaning: dict[str, Any] | None = None) -> list[str]:
-    """从字段提取合规手机号（1 开头 11 位），去前缀、丢座机/国际号，保序去重。"""
+    """从字段提取合规手机号（1 开头 11 位），保序去重，最多 5 个。
+
+    先按分隔符切段，再逐段判断：仅在段首去 +86/0086/86，带其它国家码
+    （+852/+853/+886…）的整段丢弃，座机（含区号）不匹配 11 位手机规则而丢弃。
+    绝不把不同号码的数字拼接在一起。
+    """
     cfg = cleaning or DEFAULT_CLEANING
     s = _clean_text(raw)
     if not s:
         return []
 
-    # 统一去常见前缀（含 +86 / 0086 / 裸 86）
-    for pfx in sorted(cfg.get("strip_prefixes") or ["+86", "86", "0086"], key=len, reverse=True):
-        s = s.replace(pfx, " ")
-        s = s.replace(pfx.replace("+", ""), " ") if pfx.startswith("+") else s
+    pattern = re.compile(cfg.get("mobile_pattern") or r"^1\d{10}$")
+    strip_cc = tuple(sorted(
+        {re.sub(r"\D", "", p) for p in (cfg.get("strip_prefixes") or ["+86", "86", "0086"])} - {""},
+        key=len, reverse=True,
+    ))
+    strip_cc = tuple(c.lstrip("0") or c for c in strip_cc) or ("86",)
+    strip_cc = tuple(sorted(set(strip_cc), key=len, reverse=True))
+    intl_cc = tuple(re.sub(r"\D", "", p) for p in (cfg.get("drop_intl_prefixes") or []))
 
-    # 国际号直接剔除段
-    for pfx in cfg.get("drop_intl_prefixes") or []:
-        s = s.replace(pfx, " ")
-        if pfx.startswith("+"):
-            s = s.replace(pfx[1:], " ")
-
-    seps = cfg.get("split_separators") or DEFAULT_CLEANING["split_separators"]
-    pat = "".join(re.escape(x) for x in seps if x)
-    chunks = re.split(f"[{pat}]+" if pat else r"[\s，,;；/|｜、]+", s)
+    # 强分隔符（不含空格：号码内部可能带空格，如 138 1234 5678）
+    strong = [x for x in (cfg.get("split_separators") or DEFAULT_CLEANING["split_separators"])
+              if x and not x.isspace()]
+    strong += ["，", "\n", "\r", "\t"]
+    chunks = re.split("[" + "".join(re.escape(x) for x in dict.fromkeys(strong)) + "]+", s)
 
     found: list[str] = []
-    for chunk in chunks + [s]:
-        digits = re.sub(r"\D", "", chunk or "")
-        if not digits:
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
             continue
-        # 可能粘在一起：提取所有 11 位手机
-        for m in re.findall(r"1\d{10}", digits):
-            if re.fullmatch(cfg.get("mobile_pattern") or r"^1\d{10}$", m):
-                found.append(m)
-        # 整串即手机
-        if re.fullmatch(r"1\d{10}", digits) and digits not in found:
-            found.append(digits)
+        hit = _segment_mobile(chunk, pattern, strip_cc, intl_cc)
+        if hit:
+            found.append(hit)
+            continue
+        # 整段不是一个号：可能是空格分隔的多个号码（如 "13812345678 13912345678"）
+        for tok in re.split(r"\s+", chunk):
+            hit = _segment_mobile(tok, pattern, strip_cc, intl_cc) if tok else None
+            if hit:
+                found.append(hit)
 
-    # 再从原串兜底提取
-    digits_all = re.sub(r"\D", "", s)
-    for m in re.findall(r"1\d{10}", digits_all):
-        if m not in found:
-            found.append(m)
-
-    out, seen = [], set()
-    for x in found:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out[:5]
+    return list(dict.fromkeys(found))[:5]
 
 
 def _clean_website(v: Any) -> str:
@@ -283,7 +299,7 @@ def run_maibang_clean(
         for c in (mobile_col, mobile2_col, mobile3_col):
             if c is not None:
                 raw_cells.append(str(c.iloc[i]))
-        raw_join = " ".join(raw_cells)
+        raw_join = " / ".join(raw_cells)
         mobiles = extract_valid_mobiles(raw_join, cfg)
 
         # 删除原因统计
