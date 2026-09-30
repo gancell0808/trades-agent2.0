@@ -217,10 +217,30 @@ function handleUploadResult(data) {
   setView("workspace");
 }
 
+let _limitsPromise = null;
+function getLimits() {
+  if (!_limitsPromise) {
+    _limitsPromise = fetch("/api/health")
+      .then((r) => r.json())
+      .then((d) => d.limits || {})
+      .catch(() => ({}));
+  }
+  return _limitsPromise;
+}
+
 async function uploadFiles(fileList, endpoint = "/api/upload") {
   const fd = new FormData();
   const files = Array.from(fileList || []);
   if (!files.length) throw new Error("未选择文件");
+  const lim = await getLimits();
+  const total = files.reduce((s, f) => s + f.size, 0);
+  if (lim.max_files && files.length > lim.max_files) {
+    throw new Error(`一次最多上传 ${lim.max_files} 个文件`);
+  }
+  if (lim.max_upload_bytes && total > lim.max_upload_bytes) {
+    const mb = (n) => (n / 1048576).toFixed(1);
+    throw new Error(`文件过大：共 ${mb(total)} MB，上限 ${mb(lim.max_upload_bytes)} MB，请拆分后分批上传`);
+  }
   files.forEach((f) => fd.append("file", f, f.name));
   const res = await fetch(endpoint, { method: "POST", body: fd });
   const data = await res.json();

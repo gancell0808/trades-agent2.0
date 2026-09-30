@@ -88,6 +88,21 @@ def load_cleaning_config(path: Path | None = None) -> dict[str, Any]:
 
 _CSV_ENCODINGS = ("utf-8-sig", "gb18030")
 HEADER_SCAN_ROWS = 10
+MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # xlsx 是 zip，解压后超过它按压缩炸弹处理
+
+
+def _check_zip_size(data: bytes) -> None:
+    """xlsx 是 zip 包：小文件可能解压成几个 GB，先按声明的解压大小拦截。"""
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            total = sum(i.file_size for i in z.infolist())
+    except zipfile.BadZipFile:
+        return  # 交给 pandas 报出更具体的错误
+    if total > MAX_UNCOMPRESSED_BYTES:
+        raise ValueError(f"Excel 文件解压后约 {total // (1024 * 1024)} MB，超过上限 "
+                         f"{MAX_UNCOMPRESSED_BYTES // (1024 * 1024)} MB，已拒绝读取")
 
 
 def _decode_text(data: bytes) -> str:
@@ -186,6 +201,8 @@ def read_table_ex(data: bytes, filename: str) -> tuple[pd.DataFrame, list[str]]:
     )
 
     if is_excel:
+        if data[:4] == b"PK\x03\x04":
+            _check_zip_size(data)
         try:
             sheets = pd.read_excel(io.BytesIO(data), dtype=str, header=None, sheet_name=None)
         except Exception as e:

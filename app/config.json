@@ -2,7 +2,10 @@
   "server": {
     "host": "127.0.0.1",
     "port": 8787,
-    "auto_open_browser": true
+    "auto_open_browser": true,
+    "max_upload_mb": 50,
+    "max_body_mb": 8,
+    "max_rows": 200000
   },
   "agent": {
     "system_prompt": "你是公司内部数据清洗与线索整理助手。严格按工作记录中的手机号规则、去重规则与某公司模板回答和指导。不确定写「待核实」，禁止编造清洗结果数字。",

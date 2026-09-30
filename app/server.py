@@ -64,6 +64,24 @@ APP_CFG = load_app_config()
 HOST = str(APP_CFG["server"].get("host") or "127.0.0.1")
 PORT = int(os.environ.get("TRADES_PORT") or APP_CFG["server"].get("port") or 8787)
 
+# 请求大小限制（config.json 的 server 段可调整）
+_MB = 1024 * 1024
+MAX_UPLOAD_BYTES = int(float(APP_CFG["server"].get("max_upload_mb", 50)) * _MB)   # 上传文件的请求体上限
+MAX_BODY_BYTES = int(float(APP_CFG["server"].get("max_body_mb", 8)) * _MB)        # 其它 JSON 接口的请求体上限
+MAX_ROWS = int(APP_CFG["server"].get("max_rows", 200000))                          # 一次上传合并后的最大行数
+MAX_UPLOAD_FILES = 20
+SOCKET_TIMEOUT = 60  # 秒：读请求体时对端长时间不发数据就断开，避免连接被占住
+_UPLOAD_PATHS = {"/api/upload", "/api/qa/upload"}
+
+
+class RequestError(Exception):
+    """请求本身有问题（过大、格式不对等），按 code 直接返回给客户端。"""
+
+    def __init__(self, code: int, msg: str):
+        super().__init__(msg)
+        self.code = code
+        self.msg = msg
+
 # 每个浏览器标签页一个独立会话（前端在 X-Session-Id 头里带 ID），互不覆盖。
 MAX_SESSIONS = 8
 _SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -126,8 +144,10 @@ def _safe_filename(name: str, default: str = "清洗结果") -> str:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "TradeSClean/0.3"
+    timeout = SOCKET_TIMEOUT
 
     _st_cache: dict | None = None
+    _body_limit: int = MAX_BODY_BYTES
 
     @property
     def st(self) -> dict:
@@ -174,15 +194,52 @@ class Handler(BaseHTTPRequestHandler):
                    "application/json; charset=utf-8")
 
     def _read_body(self) -> bytes:
-        n = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(n) if n else b""
+        """读取请求体。先按 Content-Length 检查上限，超限不读入内存。"""
+        if self.headers.get("Transfer-Encoding"):
+            raise RequestError(411, "不支持分块传输，请带 Content-Length")
+        raw = (self.headers.get("Content-Length") or "").strip()
+        try:
+            n = int(raw) if raw else 0
+        except ValueError:
+            raise RequestError(400, "Content-Length 无效")
+        if n < 0:
+            raise RequestError(400, "Content-Length 无效")
+        limit = self._body_limit
+        if n > limit:
+            self._drain(n)
+            self.close_connection = True
+            raise RequestError(413, f"请求过大：{n / _MB:.1f} MB，超过上限 {limit / _MB:.0f} MB")
+        body = self.rfile.read(n) if n else b""
+        if len(body) < n:
+            raise RequestError(400, "请求体不完整")
+        return body
+
+    def _drain(self, n: int, cap: int = 256 * _MB) -> None:
+        """边读边丢弃未读的请求体（不占内存），让客户端发完后能收到 413 而不是连接被重置。
+
+        只处理到 cap 为止；声明大小比这更离谱的请求直接断开。
+        """
+        left = min(n, cap)
+        try:
+            self.connection.settimeout(1.0)  # 对端不再发数据就别等了，尽快回 413
+            while left > 0:
+                chunk = self.rfile.read(min(65536, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except Exception:
+            pass
 
     def do_GET(self):
         if not self._guard():
             return
         path = unquote(urlparse(self.path).path)
         if path == "/api/health":
-            return self._json({"ok": True, "port": PORT, "host": HOST})
+            return self._json({
+                "ok": True, "port": PORT, "host": HOST,
+                "limits": {"max_upload_bytes": MAX_UPLOAD_BYTES, "max_rows": MAX_ROWS,
+                           "max_files": MAX_UPLOAD_FILES},
+            })
         if path == "/api/llm/config":
             return self._json({"store": llm_client.public_store()})
         if path == "/api/qa/sessions":
@@ -227,6 +284,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         path = unquote(urlparse(self.path).path)
+        self._body_limit = MAX_UPLOAD_BYTES if path in _UPLOAD_PATHS else MAX_BODY_BYTES
         try:
             routes = {
                 "/api/upload": self._upload,
@@ -255,6 +313,12 @@ class Handler(BaseHTTPRequestHandler):
                         return routes[path]()
                 return routes[path]()
             return self._json({"error": "not found"}, 404)
+        except RequestError as e:
+            self._json({"error": e.msg}, e.code)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._json({"error": "请求体不是合法的 JSON"}, 400)
+        except ValueError as e:  # 文件无法解析等用户侧问题
+            self._json({"error": str(e)}, 400)
         except Exception as e:
             self._json({"error": str(e)}, 500)
 
@@ -286,6 +350,9 @@ class Handler(BaseHTTPRequestHandler):
         if not frames:
             return self._json({"error": "文件为空或无法解析", "warnings": warnings}, 400)
 
+        total_rows = sum(len(f) for f in frames)
+        if total_rows > MAX_ROWS:
+            raise RequestError(413, f"数据共 {total_rows} 行，超过单次处理上限 {MAX_ROWS} 行，请拆分文件后分批处理")
         merged = merge_tables(frames) if len(frames) > 1 else frames[0]
         columns = list(merged.columns)
         mapping = auto_map_columns(columns)
@@ -713,6 +780,8 @@ def _multipart_files(body: bytes, ctype: str) -> list[tuple[str, bytes]]:
         fn = re.search(rb'filename="([^"]+)"', header)
         filename = fn.group(1).decode("utf-8", errors="replace") if fn else "upload.xlsx"
         items.append((filename, data.rstrip(b"\r\n")))
+        if len(items) > MAX_UPLOAD_FILES:
+            raise RequestError(400, f"一次最多上传 {MAX_UPLOAD_FILES} 个文件")
     return items
 
 
