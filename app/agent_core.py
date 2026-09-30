@@ -280,12 +280,12 @@ QA_FAQ = [
     ),
     (
         r"中英|英文|中文|分表|拆分",
-        "分表：可按中文/英文/其他公司名分三份，或按条数拆、按单/多手机号拆。\n"
-        "指令示例：把大表格拆分成多个小表格，每个表格约100条数据。",
+        "导出固定为某公司模板，不做按中英文 / 手机号数量 / 自定义条数的拆分；"
+        "结果超过约 1500 条时，导出会自动按约 1500 条分成多个文件。",
     ),
     (
         r"关键词",
-        "多个关键词只保留第一个。指令示例：把关键词列筛选一下，多个关键词只保留一个。",
+        "导出的某公司模板没有「关键词」列，清洗时不处理关键词。",
     ),
     (
         r"质量|分析|体检",
@@ -319,18 +319,18 @@ def local_qa_answer(question: str) -> str:
 
 
 def unsupported_requests(plan_info: dict[str, Any]) -> list[str]:
-    """指令里提到、但当前清洗流程尚未实现的能力（如实告知，不悄悄忽略）。"""
+    """指令里提到、但按设计不做的能力（导出固定为某公司模板，不裁剪列、不自定义拆分）；如实告知，不悄悄忽略。"""
     opt = plan_info.get("options") or {}
     out: list[str] = []
     if plan_info.get("extract_core") or opt.get("extract_core"):
         out.append("只提取部分字段：导出列固定为某公司导入模板（18 列），不做裁剪")
     if plan_info.get("split_name") or opt.get("split_by_name"):
-        out.append("按公司名称中/英文分表")
+        out.append("按公司名称中/英文分表：固定模板，不做拆分")
     if plan_info.get("split_phone") or opt.get("split_by_phone_count"):
-        out.append("按手机号数量分表")
+        out.append("按手机号数量分表：固定模板，不做拆分")
     chunk = int(plan_info.get("chunk_size") or opt.get("chunk_size") or 0)
     if chunk:
-        out.append(f"按每表 {chunk} 条拆分（请在导出时设置「每表条数」）")
+        out.append(f"按每表 {chunk} 条拆分：固定模板，不做自定义拆分（导出时超过约 1500 条会自动分表）")
     return out
 
 
@@ -456,7 +456,7 @@ def run_agent(
     verdict = verify_cleaned(cleaned["rows"], cfg, mp)
     unsupported = unsupported_requests(plan_info)
     if unsupported:
-        run.step("plan", "以下要求本次未执行（导出固定为模板，或功能尚未实现）", "；".join(unsupported), status="warn",
+        run.step("plan", "以下要求本次未执行（导出固定为某公司模板）", "；".join(unsupported), status="warn",
                  payload={"unsupported": unsupported})
     run.step(
         "quality_check",

@@ -99,7 +99,7 @@
                   <div class="shot-step"><b>1</b> 理解指令并生成计划</div>
                   <div class="shot-step"><b>2</b> 字段映射 ← 8 列</div>
                   <div class="shot-step"><b>3</b> 去掉号码前缀 · 去重 3 条</div>
-                  <div class="shot-step ok"><b>4</b> 中英分表 · 可导出</div>
+                  <div class="shot-step ok"><b>4</b> 验收自检 · 可导出</div>
                 </div>
                 <div class="shot-stats">
                   <div><b>8</b><span>保留</span></div>
@@ -118,23 +118,23 @@
         <div class="section-head">
           <p class="eyebrow-text">CAPABILITIES</p>
           <h2>为外贸销售日常清洗而设计</h2>
-          <p class="section-desc">覆盖数据质检、提取、电话处理、去重分表、关键词收敛等高频清洗场景。</p>
+          <p class="section-desc">覆盖电话规整、按公司名去重、验收自检、导出某公司导入模板等高频清洗场景。</p>
         </div>
         <div class="feature-grid">
           <article class="feature-card">
             <div class="feature-icon">⌘</div>
             <h3>Agent 一句话清洗</h3>
-            <p>「提取公司联系人手机，去掉号码前缀，去重，按中英文分开」——自动规划、调用工具、自检后导出。</p>
+            <p>「帮我清洗一下，去掉号码前缀，去掉座机，按公司名去重」——自动规划、执行清洗、自检后导出某公司模板。</p>
           </article>
           <article class="feature-card">
             <div class="feature-icon">☎</div>
             <h3>电话智能规整</h3>
-            <p>去掉号码前缀，只保留手机号，多余号码移入固定电话列，格式统一可直接外呼。</p>
+            <p>去掉号码前缀，只保留 1 开头 11 位手机号，多个号码依次填入常用电话 / 备用电话1 / 备用电话2。</p>
           </article>
           <article class="feature-card">
             <div class="feature-icon">⧉</div>
-            <h3>去重与多分表</h3>
-            <p>手机/官网/公司名三级去重；中文名、英文名、其他名称分表；按条数或手机号数量拆表。</p>
+            <h3>去重与分表</h3>
+            <p>按公司名称去重（忽略全/半角、大小写、空白与标点），保留第一条有效记录；导出结果超过约 1500 条时自动分表。</p>
           </article>
           <article class="feature-card">
             <div class="feature-icon">◎</div>
@@ -346,15 +346,11 @@
         </div>
 
         <div class="agent-box">
-          <textarea id="agent-instruction" rows="4" placeholder="例如：帮我处理这个表格：提取公司名称、联系人、手机号码；去掉号码前缀，只保留手机号；去重；按中文/英文公司名称分成两个表格。"></textarea>
+          <textarea id="agent-instruction" rows="4" placeholder="例如：帮我清洗这个表格：去掉号码前缀，只保留手机号，去掉座机，按公司名称去重。"></textarea>
           <div class="chips" id="agent-examples">
-            <button type="button" class="chip chip-btn" data-text="帮我处理这个表格：提取公司名称、联系人、手机号码，去掉号码前缀，只保留手机号，去掉座机，进行去重，按中文/英文公司名称分成两个表格">组合指令</button>
+            <button type="button" class="chip chip-btn" data-text="帮我清洗这个表格：去掉号码前缀，只保留手机号，去掉座机，按公司名称去重">组合指令</button>
             <button type="button" class="chip chip-btn" data-text="分析一下这个表格数据质量怎么样">数据质量</button>
-            <button type="button" class="chip chip-btn" data-text="把电话号码处理一下：去掉号码前缀，只保留手机号码（去掉座机），常用电话列只保留一个电话，多余电话移到固定电话列">电话处理</button>
-            <button type="button" class="chip chip-btn" data-text="提取公司名称、联系人、手机号码、链接，整理成表格">字段提取</button>
-            <button type="button" class="chip chip-btn" data-text="去重后按中文名称和英文名称分别整理成两个表格，再按手机号数量分成单个手机号和多个手机号两份">去重分表</button>
-            <button type="button" class="chip chip-btn" data-text="把关键词列筛选一下，多个关键词只保留一个">关键词清洗</button>
-            <button type="button" class="chip chip-btn" data-text="把大表格拆分成多个小表格，每个表格约100条数据">按条数拆表</button>
+            <button type="button" class="chip chip-btn" data-text="把电话号码处理一下：去掉号码前缀，只保留手机号码（去掉座机和国际号）">电话处理</button>
           </div>
           <div class="row gap">
             <label class="check"><input type="checkbox" id="agent-use-llm" checked /> 用大模型理解指令</label>

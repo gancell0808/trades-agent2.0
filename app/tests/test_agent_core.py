@@ -62,10 +62,16 @@ class AgentRun(unittest.TestCase):
         warn = [x for x in steps(out, "plan") if x["status"] == "warn"]
         self.assertTrue(warn)
         txt = warn[0]["detail"]
-        self.assertIn("中/英文分表", txt)
+        self.assertIn("中/英文分表：固定模板，不做拆分", txt)
+        self.assertIn("100", txt)
         self.assertIn("100", txt)
         self.assertIn("导出列固定为某公司导入模板", txt)
         self.assertIn("未执行", out["result_summary"]["review"])
+
+    def test_phone_count_split_reported_as_fixed_template(self):
+        out = run_agent(DF, "再按手机号数量分成单个手机号和多个手机号两份", use_llm=False)
+        txt = [x for x in steps(out, "plan") if x["status"] == "warn"][0]["detail"]
+        self.assertIn("按手机号数量分表：固定模板，不做拆分", txt)
 
     def test_no_unsupported_warning_for_plain_clean(self):
         out = run_agent(DF, "帮我清洗一下", use_llm=False)
