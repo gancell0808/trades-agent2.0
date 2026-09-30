@@ -23,7 +23,7 @@ from clean_engine import (
     export_maibang_bytes,
     load_cleaning_config,
     merge_tables,
-    read_table,
+    read_table_ex,
     run_maibang_clean,
     split_and_export,
     suggest_source,
@@ -268,20 +268,23 @@ class Handler(BaseHTTPRequestHandler):
         payload = json.loads(body.decode("utf-8") or "{}")
         raw = payload.get("content", "")
         filename = payload.get("filename") or "pasted.csv"
-        return [(filename, read_table(raw.encode("utf-8"), filename))]
+        df, warns = read_table_ex(raw.encode("utf-8"), filename)
+        return [(filename, df, warns)]
 
     def _upload(self):
         items = self._parse_upload()
         if not items:
             return self._json({"error": "未读到文件"}, 400)
-        frames, names = [], []
-        for filename, df in items:
+        frames, names, warnings = [], [], []
+        for filename, df, warns in items:
+            warnings.extend(warns)
             if df is None or df.empty:
+                warnings.append(f"{filename}：没有读到任何数据行，已忽略")
                 continue
             frames.append(df)
             names.append(filename)
         if not frames:
-            return self._json({"error": "文件为空或无法解析"}, 400)
+            return self._json({"error": "文件为空或无法解析", "warnings": warnings}, 400)
 
         merged = merge_tables(frames) if len(frames) > 1 else frames[0]
         columns = list(merged.columns)
@@ -306,6 +309,7 @@ class Handler(BaseHTTPRequestHandler):
             "columns": columns,
             "mapping": mapping,
             "sample": sample,
+            "warnings": warnings,
             "template_columns": MAIBANG_COLUMNS,
         })
 
@@ -458,7 +462,7 @@ class Handler(BaseHTTPRequestHandler):
         ctype = self.headers.get("Content-Type", "")
         try:
             if "multipart/form-data" in ctype:
-                items = _parse_multipart_multi(body, ctype)
+                items = _multipart_files(body, ctype)
             else:
                 payload = json.loads(body.decode("utf-8") or "{}") or {}
                 filename = payload.get("filename") or "file.txt"
@@ -693,14 +697,14 @@ def _url_quote(s: str) -> str:
     return quote(s)
 
 
-def _parse_multipart_multi(body: bytes, ctype: str):
+def _multipart_files(body: bytes, ctype: str) -> list[tuple[str, bytes]]:
+    """解析 multipart，返回 [(文件名, 原始字节)]。"""
     m = re.search(r'boundary="?([^";]+)"?', ctype)
     if not m:
         raise ValueError("multipart boundary 缺失")
     boundary = b"--" + m.group(1).encode()
-    parts = body.split(boundary)
-    items = []
-    for part in parts:
+    items: list[tuple[str, bytes]] = []
+    for part in body.split(boundary):
         if b"Content-Disposition" not in part:
             continue
         header, _, data = part.partition(b"\r\n\r\n")
@@ -708,10 +712,19 @@ def _parse_multipart_multi(body: bytes, ctype: str):
             continue
         fn = re.search(rb'filename="([^"]+)"', header)
         filename = fn.group(1).decode("utf-8", errors="replace") if fn else "upload.xlsx"
-        file_bytes = data.rstrip(b"\r\n")
+        items.append((filename, data.rstrip(b"\r\n")))
+    return items
+
+
+def _parse_multipart_multi(body: bytes, ctype: str):
+    """multipart → [(文件名, 表, 读取提示)]；空文件返回 (文件名, None, [])。"""
+    items = []
+    for filename, file_bytes in _multipart_files(body, ctype):
         if not file_bytes:
+            items.append((filename, None, []))
             continue
-        items.append((filename, read_table(file_bytes, filename)))
+        df, warns = read_table_ex(file_bytes, filename)
+        items.append((filename, df, warns))
     return items
 
 

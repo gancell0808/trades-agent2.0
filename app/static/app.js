@@ -205,7 +205,14 @@ function handleUploadResult(data) {
   const und = $("#agent-understand");
   und.classList.remove("hidden");
   und.classList.add("ok");
-  und.textContent = `已载入：${data.filename} · ${data.rows} 行。给 Agent 下一条清洗指令开始。`;
+  const warns = data.warnings || [];
+  und.innerHTML =
+    escapeHtml(`已载入：${data.filename} · ${data.rows} 行。给 Agent 下一条清洗指令开始。`) +
+    (warns.length
+      ? `<div class="read-warn" style="margin-top:8px;color:#d9480f"><b>读取提示（请核对）：</b><ul style="margin:4px 0 0 18px">${warns
+          .map((w) => `<li>${escapeHtml(w)}</li>`)
+          .join("")}</ul></div>`
+      : "");
   $("#agent-steps").innerHTML = "";
   setView("workspace");
 }

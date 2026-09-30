@@ -86,32 +86,138 @@ def load_cleaning_config(path: Path | None = None) -> dict[str, Any]:
 # 读表 / 映射
 # ---------------------------------------------------------------------------
 
-def read_table(data: bytes, filename: str) -> pd.DataFrame:
-    name = (filename or "").lower()
-    bio = io.BytesIO(data)
-    try:
-        if name.endswith((".xlsx", ".xls", ".xlsm")):
-            df = pd.read_excel(bio, dtype=str)
-        else:
-            try:
-                bio.seek(0)
-                df = pd.read_csv(bio, dtype=str, encoding="utf-8-sig", on_bad_lines="skip")
-            except UnicodeDecodeError:
-                bio.seek(0)
-                df = pd.read_csv(bio, dtype=str, encoding="gbk", on_bad_lines="skip")
-    except Exception:
-        bio.seek(0)
+_CSV_ENCODINGS = ("utf-8-sig", "gb18030")
+HEADER_SCAN_ROWS = 10
+
+
+def _decode_text(data: bytes) -> str:
+    for enc in _CSV_ENCODINGS:
         try:
-            df = pd.read_excel(bio, dtype=str)
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("无法识别文件编码（支持 UTF-8 / GBK）")
+
+
+def _csv_rows(text: str, filename: str) -> list[list[str]]:
+    import csv
+
+    if filename.endswith((".tsv", ".tab")):
+        delim = "\t"
+    else:
+        try:
+            delim = csv.Sniffer().sniff(text[:4096], delimiters=",\t;|").delimiter
+        except csv.Error:
+            delim = ","
+    return [list(r) for r in csv.reader(io.StringIO(text, newline=""), delimiter=delim)]
+
+
+def _is_blank(row: list[str]) -> bool:
+    return not any(str(c).strip() for c in row)
+
+
+def _header_is_usable(row: list[str]) -> bool:
+    """这一行像不像表头：能同时识别出公司名称和手机/电话列。"""
+    m = auto_map_columns([str(c).strip() for c in row if str(c).strip()])
+    return "company_name" in m and "mobile" in m
+
+
+def _rows_to_df(rows: list[list[str]], label: str, warnings: list[str]) -> pd.DataFrame:
+    """原始行 → DataFrame。自动找表头行；行长度与表头不一致时如实告警而不是静默丢弃。"""
+    rows = [r for r in rows if not _is_blank(r)]
+    if not rows:
+        return pd.DataFrame()
+
+    head_idx = 0
+    if not _header_is_usable(rows[0]):
+        for i in range(1, min(HEADER_SCAN_ROWS, len(rows))):
+            if _header_is_usable(rows[i]):
+                head_idx = i
+                warnings.append(f"{label}：第 {i + 1} 行被识别为表头，其上方 {i} 行（标题/说明）已忽略")
+                break
+
+    header = [str(c).strip() for c in rows[head_idx]]
+    width = len(header)
+    while width and not header[width - 1]:
+        width -= 1                      # 去掉表头右侧的空列
+    header = header[:width]
+    if not header:
+        return pd.DataFrame()
+    names, seen = [], {}
+    for i, h in enumerate(header):
+        h = h or f"Unnamed: {i}"
+        n = seen.get(h, 0)
+        seen[h] = n + 1
+        names.append(h if n == 0 else f"{h}.{n}")
+
+    body, too_long = [], []
+    for r in rows[head_idx + 1:]:
+        r = [str(c) if c is not None else "" for c in r]
+        if len(r) > width and any(c.strip() for c in r[width:]):
+            too_long.append(r)
+            continue
+        body.append((r + [""] * width)[:width])
+    if too_long:
+        sample = "；".join(",".join(x)[:40] for x in too_long[:3])
+        warnings.append(
+            f"{label}：有 {len(too_long)} 行的列数比表头多（常见原因：字段内含未加引号的逗号），"
+            f"这些行未导入，请检查原文件。示例：{sample}"
+        )
+
+    df = pd.DataFrame(body, columns=names, dtype=str)
+    df = df.replace(r"^\s*$", pd.NA, regex=True)
+    df = df.dropna(how="all").dropna(axis=1, how="all").reset_index(drop=True)
+    return df
+
+
+def read_table_ex(data: bytes, filename: str) -> tuple[pd.DataFrame, list[str]]:
+    """读取 CSV / Excel。返回 (表, 提示列表)；提示用于告诉用户读取时发生了什么。
+
+    - Excel：读取全部 sheet 并按列名合并（不再只读第一个）
+    - CSV：自动识别 UTF-8 / GBK 与分隔符，支持引号内换行
+    - 自动跳过表头上方的标题/说明行；列数异常的行会被报告，而不是静默丢弃
+    """
+    name = (filename or "").lower()
+    warnings: list[str] = []
+    is_excel = (
+        name.endswith((".xlsx", ".xls", ".xlsm"))
+        or data[:4] == b"PK\x03\x04"
+        or data[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+    )
+
+    if is_excel:
+        try:
+            sheets = pd.read_excel(io.BytesIO(data), dtype=str, header=None, sheet_name=None)
         except Exception as e:
             raise ValueError(f"无法解析文件：{e}") from e
+        frames, used, skipped = [], [], []
+        first_cols = None
+        for sheet_name, raw in sheets.items():
+            rows = raw.fillna("").astype(str).values.tolist()
+            df = _rows_to_df(rows, f"{filename} · {sheet_name}", warnings)
+            if df.empty:
+                skipped.append(str(sheet_name))
+                continue
+            if first_cols is None:
+                first_cols = set(df.columns)
+            elif set(df.columns) != first_cols:
+                warnings.append(f"{filename} · {sheet_name}：列名与第一个有数据的 sheet 不完全一致，已按列名合并")
+            frames.append(df)
+            used.append(str(sheet_name))
+        if len(used) > 1:
+            warnings.append(f"{filename}：包含 {len(used)} 个有数据的 sheet（{'、'.join(used)}），已合并读取")
+        if skipped and frames:
+            warnings.append(f"{filename}：空 sheet 已忽略（{'、'.join(skipped)}）")
+        df = merge_tables(frames) if frames else pd.DataFrame()
+    else:
+        df = _rows_to_df(_csv_rows(_decode_text(data), name), filename, warnings)
 
-    df = df.dropna(how="all").reset_index(drop=True)
-    df = df.dropna(axis=1, how="all")
-    if df.empty:
-        return df
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
+    return df, warnings
+
+
+def read_table(data: bytes, filename: str) -> pd.DataFrame:
+    """兼容旧接口：只返回表，不返回提示。"""
+    return read_table_ex(data, filename)[0]
 
 
 def merge_tables(frames: list[pd.DataFrame]) -> pd.DataFrame:
