@@ -60,7 +60,8 @@
       "淘到客户时间"
     ],
     "output_dir": "",
-    "split_rows": 1500
+    "split_rows": 1500,
+    "dedupe_normalize": true
   },
   "ui": {
     "title": "TradeS Agent · 数据清洗助手",

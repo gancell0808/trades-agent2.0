@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import json
 import re
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,7 @@ DEFAULT_CLEANING: dict[str, Any] = {
     "drop_landline": True,
     "split_separators": ["、", "；", ";", "/", ",", " ", "　", "|", "｜", "\n", "\t"],
     "dedupe_key": "公司名称",
+    "dedupe_normalize": True,  # 去重前规范化公司名（全/半角、大小写、空白、标点）
     "drop_empty_mobile": True,
     "mobile_slots": MOBILE_SLOTS,
     "template_columns": MAIBANG_COLUMNS,
@@ -289,6 +291,15 @@ def classify_unusable(raw: Any, cleaning: dict[str, Any] | None = None) -> str:
     return "empty"
 
 
+def normalize_company_key(name: str) -> str:
+    """去重用的公司名规范化：NFKC（全角→半角）、忽略大小写、去掉空白和标点。
+
+    刻意不去掉「有限公司 / Co., Ltd.」等后缀：后缀不同可能是不同的法人主体，宁可漏去重也不误删。
+    """
+    s = unicodedata.normalize("NFKC", str(name or "")).casefold()
+    return "".join(ch for ch in s if unicodedata.category(ch)[0] not in ("Z", "P", "C"))
+
+
 def _clean_website(v: Any) -> str:
     s = _clean_text(v)
     if not s:
@@ -373,7 +384,7 @@ def run_maibang_clean(
             continue
 
         # 公司名去重
-        key = company
+        key = normalize_company_key(company) if cfg.get("dedupe_normalize", True) else company
         if key in seen_company:
             stats["duplicated_company"] += 1
             if len(dropped_samples) < 12:
